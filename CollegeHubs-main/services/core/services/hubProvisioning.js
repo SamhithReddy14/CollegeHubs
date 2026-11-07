@@ -1,0 +1,105 @@
+const mongoose = require('mongoose');
+const College = require('../models/College');
+const Hub = require('../models/Hub');
+const Channel = require('../models/Channel');
+const User = require('../models/User');
+const { config, activeDomainFilter, safeTheme } = require('../config/collegeRegistry');
+
+async function transaction(work, connection = mongoose.connection) {
+  // Concurrent first registrations can collide on unique upsert keys. Retry the entire transaction.
+  for (let attempt = 0; attempt < 3; attempt++) {
+    try { return await connection.transaction(work); }
+    catch (err) { if (err.code !== 11000 || attempt === 2) throw err; }
+  }
+}
+async function ensureHubForCollege(collegeId, session, connection = mongoose.connection) {
+  if (!session) return transaction(activeSession => ensureHubForCollege(collegeId, activeSession, connection), connection);
+  const CollegeModel = connection.model('College', College.schema);
+  const HubModel = connection.model('Hub', Hub.schema);
+  const ChannelModel = connection.model('Channel', Channel.schema);
+  const college = await CollegeModel.findOne({ _id: collegeId, status: 'active' }).session(session);
+  if (!college) throw new Error('Active college required');
+  await college.validate();
+  const id = new mongoose.Types.ObjectId();
+  const hub = await HubModel.findOneAndUpdate({ collegeId: college._id }, { $setOnInsert: {
+    _id: id, hubId: id, collegeId: college._id, status: 'active',
+  }, $set: { slug: college.slug, name: college.name,
+    verifiedEmailDomains: college.domains.map(item => item.normalizedDomain),
+    themeTokens: safeTheme(college.themeTokens), themeVersion: college.themeVersion, logoUrl: college.logoUrl,
+    timezone: college.timezone, defaultChannelSet: college.defaultChannels.map(item => item.slug),
+    provisionVersion: college.configVersion,
+  } }, { upsert: true, new: true, session, runValidators: true, setDefaultsOnInsert: false });
+  if (hub.status !== 'active') throw new Error('Hub is disabled');
+  for (const channel of college.defaultChannels) {
+    await ChannelModel.updateOne({ hubId: hub._id, slug: channel.slug }, { $setOnInsert: {
+      hubId: hub._id, slug: channel.slug, title: channel.title, kind: channel.kind,
+      nextMessageSeq: 0, defaultSetVersion: college.configVersion, archivedAt: null,
+    } }, { upsert: true, session, runValidators: true });
+  }
+  return hub;
+}
+async function assignMembership(userId, activeSession) {
+  const work = async session => {
+    const user = await User.findById(userId).select('+googleSubject +emailVerifiedAt +emailVerificationMethod').session(session);
+    if (!user) throw new Error('User no longer exists');
+    // No self-service transfer or reactivation. Assigned/disabled users retain their current identity.
+    if (user.membershipStatus === 'disabled') return user;
+    if (!user.emailVerifiedAt || !['email','google'].includes(user.emailVerificationMethod)) return user;
+    const college = await College.findOne(activeDomainFilter(user.email)).session(session);
+    if (!college) return user;
+    const hub = await ensureHubForCollege(college._id, session);
+    if (user.hubId && String(user.hubId) !== String(hub._id)) throw new Error('College transfer requires review');
+    if (user.membershipStatus === 'active' && user.membershipVerified) return user;
+    user.hubId = hub._id;
+    user.college = college.name;
+    user.membershipStatus = 'active';
+    user.membershipVerified = true;
+    user.verificationMethod = user.emailVerificationMethod;
+    user.membershipVersion += 1;
+    await user.save({ session });
+    return user;
+  };
+  return activeSession ? work(activeSession) : transaction(work);
+}
+async function tryAssignMembership(user) {
+  try {
+    const assigned = await assignMembership(user._id);
+    if (assigned.membershipStatus === 'disabled') return { user: assigned, assignment: { status: 'disabled', code: 'MEMBERSHIP_DISABLED', message: 'Membership is disabled. Contact your administrator.', retryable: false } };
+    if (!assigned.emailVerifiedAt || !['email','google'].includes(assigned.emailVerificationMethod)) return { user: assigned, assignment: { status: 'verification-pending', code: 'EMAIL_VERIFICATION_REQUIRED', message: 'Verify your email before joining a college Hub.', retryable: false } };
+    return { user: assigned, assignment: assigned.membershipStatus === 'active' && assigned.membershipVerified ? { status: 'assigned', retryable: false } : {
+      status: 'unassigned', code: 'COLLEGE_DOMAIN_NOT_CONFIGURED', message: 'Your college email domain is not configured. You can retry after it is added.', retryable: true,
+    } };
+  } catch {
+    // Account exists independently; rollback leaves it unassigned and safely retryable.
+    const current = await User.findById(user._id);
+    return { user: current, assignment: { status: 'pending', code: 'ASSIGNMENT_UNAVAILABLE', message: 'College assignment is temporarily unavailable. Please retry.', retryable: true } };
+  }
+}
+async function seedColleges(connection = mongoose.connection) {
+  const colleges = connection.model('College', College.schema);
+  const hubs = connection.model('Hub', Hub.schema);
+  const channels = connection.model('Channel', Channel.schema);
+  await Promise.all([colleges.init(), hubs.init(), channels.init()]);
+  for (const entry of config.colleges) {
+    const fields = { ...entry, logoUrl: entry.logoUrl || null, themeTokens: entry.themeTokens || config.defaultTheme, defaultChannels: config.defaultChannels };
+    const candidate = new colleges(fields);
+    await candidate.validate();
+    const existing = await colleges.findOne({ slug: entry.slug });
+    if (existing) {
+      const brandingChanged = existing.name !== candidate.name || existing.logoUrl !== candidate.logoUrl ||
+        JSON.stringify(safeTheme(existing.themeTokens)) !== JSON.stringify(safeTheme(candidate.themeTokens));
+      if (candidate.themeVersion < existing.themeVersion || (brandingChanged && candidate.themeVersion <= existing.themeVersion)) {
+        throw new Error('Increase themeVersion when changing college branding');
+      }
+      existing.set(fields); await existing.save();
+    }
+    else await candidate.save();
+  }
+}
+async function provisionConfiguredHubs(connection = mongoose.connection) {
+  await seedColleges(connection);
+  const active = await connection.model('College').find({ status: 'active' });
+  for (const college of active) await ensureHubForCollege(college._id, undefined, connection);
+  return active.length;
+}
+module.exports = { provisionConfiguredHubs, ensureHubForCollege, assignMembership, tryAssignMembership, seedColleges };

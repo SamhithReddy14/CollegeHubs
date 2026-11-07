@@ -1,0 +1,38 @@
+# P11.1 deployment runbook
+
+**Current transition status (20 October 2026):** TP11.1 local release preparation is underway; the richer transition checkout is not deployed. See [current evidence and remaining gates](tp11.1-evidence.md). Account observations and deployment IDs below are historical. Use retained migrations, not fresh-demo bootstrap, for an existing database.
+
+Status: P11.1 complete for the deployed password-login MVP slice (2026-10-10). P11.2 release demos remain next. See [P11.1 evidence](p11.1-evidence.md) for the exact hosted/local boundaries. P10 features remain separate development work.
+
+## Account observations — 2026-10-10
+
+Render: four Free services are deployed in the existing Hobby workspace. The shared Cloudflare Pages app is live at https://collegehubs.pages.dev. All four direct API readiness probes returned HTTP 200 on 2026-10-10. Gateway readiness also passed: Core uses /api/health; modules use /api/{module}/health/ready. Protected sessions reject anonymous requests with 401; all three module handoff-start endpoints return 201 with Secure, HttpOnly, SameSite=Lax cookies. SPA module deep links return 200. These are smoke checks, not full feature acceptance.
+
+Interview's first deployment failed during startup. Its original logging did not preserve the precise error. Commit 79cb958 increases database selection timeout from 3s to 15s and adds sanitized startup-stage diagnostics. Render deployment dep-db54fv8ae00c739b8ubg succeeded, and its public readiness probe passed. The observed recovery is consistent with startup latency; the original exception cannot be proved retrospectively.
+
+Atlas isolation was verified: each staging user can access its own database (CoreDatabase1, ArcadeDatabase1 or InterviewDatabase1), and reads from both sibling databases are denied. Dedicated Neon role collegehubs_learn_staging and database collegehubs_demo_learn_staging were created; schema v2 and the DSA/Web curriculum were provisioned. Core's CVR hub and scoped module credentials were provisioned. Secrets remain in ignored local staging files and the appropriate Render service environments. Cloudflare contains public origins only and is configured to fail closed when its Functions allowance is exhausted.
+
+The origin repository is https://github.com/sahtiwk/CollegeHubs.git; main was pushed. Current application deployment commit: 79cb9585b25ba4bc5ad7cabc6deb7a10db1d62f6. Verified origins and smoke evidence are retained in ignored .local/deployment-origins.json and .local/p11-evidence/hosted-smoke.json. All four Render build-path filters now match render.yaml. Pages watches apps/web/*, packages/contracts/*, package.json and package-lock.json. Account usage, network restrictions, feature flows and restart evidence are recorded in the P11.1 evidence document. Initial account observation was Hobby with no payment card and 0/750 instance hours; it is not a current usage measurement.
+
+## Deployment order
+
+1. Review source to publish and connect only the CollegeHubs repository to Render and Cloudflare. Use the user's existing accounts; account owners complete sign-in, MFA and GitHub access grants.
+2. Confirm all selected resources are Free and no paid fallback is enabled. Four Render services share workspace hours; allow sleep and cold starts. Do not add keepalive jobs. See [Render Free](https://render.com/docs/free).
+3. Create a Cloudflare Pages project for the shared frontend and retain its assigned `pages.dev` origin. Root `apps/web`; build `cd ../.. && npm ci --include=dev && npm run build:web`; output `dist`; Node `24.12.0`. Keep production and preview settings separate. Never derive a hostname from the project name without checking its assigned URL.
+4. Create three Atlas logical databases with separate restricted users for Core, Arcade and Interview. Use TLS, a Free cluster, and the actual Render outbound ranges. Confirm each credential fails to read a sibling database. Verify transactions using explicitly disposable fixture records. Existing database credentials must be checked, not assumed to be isolated.
+5. Create a fresh Neon database `collegehubs_demo_learn_staging` with Learn-only credentials. Confirm it is empty before the guarded bootstrap described in [deploy README](../deploy/README.md). Do not reset an existing database.
+6. Generate staging secrets with `node deploy/prepare-staging-keys.mjs`. It writes ignored `.local/staging/credentials.json`, preserves an existing bundle, and changes no database/provider or active `.env`. Core receives `core` values; each module receives only its own `modules` entry. Provision each `provisioning` entry through the Core stdin tool against the explicitly selected staging Core database. Never put the bundle in Git, chat, screenshots or frontend variables.
+7. Use `render.yaml` for workspace builds and explicit Free plans. Deploy Core first, then each module. Keep root build context. Set service-specific database URLs; all four services use the exact Pages `APP_ORIGIN`, and Core's `ALLOWED_ORIGINS` includes it. Modules use Core's assigned HTTPS `CORE_API_BASE_URL`. Keep the same JWT secret across restarts; if using the generated staging bundle, replace the Blueprint-generated value before first use. Interview additionally receives the existing Groq key and confirmed Free-account flag.
+8. Set Pages runtime variables `CORE_API_ORIGIN`, `LEARN_API_ORIGIN`, `ARCADE_API_ORIGIN`, `INTERVIEW_API_ORIGIN` to verified service origins. Build with `VITE_CORE_SOCKET_ORIGIN` equal to Core's origin. No service key, database URL, RSA private key or Groq key belongs in Pages or Vite variables. Configure Google sign-in only after both frontend and Core are configured for the hosted origin.
+9. Record assigned origins in ignored `.local/deployment-origins.json`, together with exact deployed commit and provider deployment IDs. Copy `deploy/origins.example.json` only when no record exists. Do not invent URLs or mark status deployed before checking readiness.
+
+## Exit-check evidence
+
+- Hosted: all four readiness endpoints, gateway routing, protected session boundaries, secure cookies, Origin/CSRF rejection, replay rejection, password login, module handoffs and UI deep links passed.
+- Hosted: synthetic PDF extraction and real Groq generation/evaluation passed. NumberGuess and Learn checkpoint completion produced settled Core receipts; ledger counts were exactly one per tested event.
+- Hosted: authenticated direct WebSocket joined a channel and recovered the acknowledged Study Room draft after a real Core restart. The deadline worker subsequently closed the room and delivered its contribution reward.
+- Hosted: Interview redeployed independently in 54.9 seconds while eight Core readiness samples remained HTTP 200. An interrupted generation recovered after redeployment.
+- Local: the full isolated fixture passed 101 guards with zero skips. Disconnect probes returned 503 for Core/Arcade/Interview. Taking only the disposable Learn database offline returned Learn 503 while its siblings stayed 200; the database was restored afterward. Hosted databases were not deliberately disabled.
+- Provider configuration: Free plans retained; Render reported $0 accrued/projected charges. Atlas now permits the two Render Oregon outbound ranges and the current development /32 only. Cloudflare fail-closed configuration was verified without deliberately exhausting quota.
+
+See [rollback](rollback.md) before redeploying a version with active user data. P11.2 records the release demos after these prerequisites are satisfied.

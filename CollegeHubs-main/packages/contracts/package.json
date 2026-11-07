@@ -1,0 +1,19 @@
+{
+  "name": "@collegehubs/contracts",
+  "version": "1.0.0",
+  "private": true,
+  "exports": {
+    "./module-read.cjs": "./module-read.cjs",
+    "./module-token.cjs": "./module-token.cjs",
+    "./module-session.cjs": "./module-session.cjs",
+    "./channel.cjs": "./channel.cjs",
+    "./arcade-games.json": "./arcade-games.json",
+    "./learn-topics.cjs": "./learn-topics.cjs",
+    "./arcade-daily.cjs": "./arcade-daily.cjs",
+    "./day-policy.cjs": "./day-policy.cjs",
+    "./delivery-policy.cjs": "./delivery-policy.cjs",
+    "./learn-curricula.json": "./learn-curricula.json",
+    "./inference.cjs": "./inference.cjs",
+    "./feedback-stream.cjs": "./feedback-stream.cjs"
+  }
+}

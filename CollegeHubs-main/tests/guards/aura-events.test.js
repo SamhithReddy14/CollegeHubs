@@ -1,0 +1,546 @@
+const test = require('node:test');
+const assert = require('node:assert/strict');
+process.env.JWT_SECRET = 'g3-disposable-fixture-secret';
+process.env.ALLOWED_ORIGINS = 'http://localhost:5173';
+process.env.ENABLE_MODULES = '';
+require('mongoose').set('autoCreate', false).set('autoIndex', false);
+const { createApp } = require('../../services/core/app');
+const { validateEvent, canonicalJson } = require('../../services/core/services/auraEventService');
+
+test('G3: Interview validates five typed questions and grades against all five slots', () => {
+  const { validateQuestions, evaluateReport } = require('../../services/interview/src/services/evaluationPolicy');
+  const types=['technical','behavioral'];
+  const input={questions:Array.from({length:5},(_,i)=>({questionText:'Explain synthetic example '+i,category:types[i%2],difficulty:'medium',expectedKeywords:['example']}))};
+  const questions=validateQuestions(input,types);assert.equal(questions.length,5);assert.equal(new Set(questions.map(q=>q.id)).size,5);
+  assert.throws(()=>validateQuestions({questions:input.questions.slice(0,4)},types));
+  assert.throws(()=>validateQuestions({...input,score:100},types));
+  assert.throws(()=>validateQuestions({questions:input.questions.map(q=>({...q,category:'coding'}))},types));
+  const answers=questions.map((q,i)=>({questionId:q.id,answer:i<3?'A saved synthetic answer':'',skipped:i>=3,revision:1}));
+  const provider={summary:'Synthetic feedback',answers:questions.map(q=>({questionId:q.id,score:8,feedback:'Explain the tradeoff more clearly.'}))};
+  const report=evaluateReport(provider,questions,answers);assert.equal(report.score,48);assert.equal(report.answeredCount,3);assert.deepEqual(report.answers.map(a=>a.score),[8,8,8,0,0]);
+  assert.throws(()=>evaluateReport({...provider,answers:provider.answers.slice(0,4)},questions,answers));
+  assert.throws(()=>evaluateReport({...provider,answers:provider.answers.map(a=>({...a,score:11}))},questions,answers));
+  assert.throws(()=>evaluateReport({...provider,answers:provider.answers.map(a=>({...a,questionId:'foreign'}))},questions,answers));
+  assert.throws(()=>evaluateReport({...provider,rawScore:100},questions,answers));
+});
+
+test('G3: payload hashing is independent of property order and unsupported/unsafe payloads fail', () => {
+  assert.equal(canonicalJson({ b: 2, a: { d: 4, c: 3 } }), canonicalJson({ a: { c: 3, d: 4 }, b: 2 }));
+  for (const value of [null, {}, [], { awardedAura: 99 }]) assert.throws(() => validateEvent(value), { code: 'INVALID_EVENT' });
+});
+
+test('G3: event ingestion requires a service credential, never a browser score', async () => {
+  const server = createApp({ connection: { readyState: 1 } }).listen(0);
+  await new Promise(resolve => server.once('listening', resolve));
+  try {
+    const response = await fetch('http://127.0.0.1:' + server.address().port + '/api/aura/events', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ awardedAura: 999 }),
+    });
+    assert.equal(response.status, 401);
+    assert.equal((await response.json()).error.code, 'SERVICE_AUTH_REQUIRED');
+  } finally { await new Promise(resolve => server.close(resolve)); }
+});
+
+// Run with GUARD_MONGO_URI pointing ONLY to a disposable replica-set database.
+// No .env loading, provider calls, dependency downloads or existing database reset.
+test('G3: transactional receipt, caps, principal and recovery boundaries', { skip: !process.env.GUARD_MONGO_URI }, async t => {
+  const mongoose = require('mongoose');
+  const { randomUUID } = require('node:crypto');
+  const { digest, opaque } = require('../../services/core/services/moduleTokenService');
+  const { createAuraEventService } = require('../../services/core/services/auraEventService');
+  const rules = { version: 'fixture-v1', timezone: 'Asia/Kolkata', timezonePolicyVersion: 1,
+    types: {
+      'arcade.game_completed': { weight: 5, countCap: 3, sourceCap: 30 },
+      'interview.completed': { weight: 20, countCap: 2, sourceCap: 60 },
+      'learn.quiz_completed': { weight: 5, countCap: 5, sourceCap: 100 },
+      'learn.node_mastered': { weight: 15, countCap: 100, sourceCap: 100 },
+    } };
+  const names = ['College', 'Hub', 'User', 'Channel', 'Message', 'NativeFact', 'Problem', 'StudyRoom', 'StudySolution', 'PeerReview', 'ModuleGrant', 'ServiceCredential', 'AuraRuleSet', 'AuraEvent', 'AuraBalance', 'AuraDayCounter', 'DailyActivity'];
+  const models = Object.fromEntries(names.map(name => [name, require('../../services/core/models/' + name)]));
+  const dbName = 'collegehubs_demo_g3_' + randomUUID().replaceAll('-', '');
+  const uri = new URL(process.env.GUARD_MONGO_URI);
+  assert.ok(['127.0.0.1', 'localhost'].includes(uri.hostname), 'Guard DB must be local and disposable');
+  await mongoose.connect(process.env.GUARD_MONGO_URI, { dbName, serverSelectionTimeoutMS: 3000 });
+  let server;
+  try {
+    await Promise.all(Object.values(models).map(async model => { await model.createCollection(); await model.createIndexes(); }));
+    const theme = require('../../services/core/config/collegeRegistry').config.defaultTheme;
+    const college = await models.College.create({ name: 'G3 Fixture', slug: dbName.replaceAll('_', '-'), status: 'active', timezone: 'Asia/Kolkata',
+      domains: [{ normalizedDomain: 'g3.example.test', verifiedAt: new Date(), evidenceRef: 'synthetic fixture' }] });
+    const hub = await models.Hub.create({ name: college.name, slug: college.slug, collegeId: college.id, themeTokens: theme, themeVersion: 1, timezone: college.timezone });
+    const user = await models.User.create({ username: 'g3-user', email: 'g3@g3.example.test', password: opaque(), hubId: hub.id, membershipStatus: 'active', membershipVerified: true, verificationMethod: 'email', emailVerificationMethod: 'email', emailVerifiedAt: new Date(), membershipVersion: 1 });
+    const keys = {}, credentials = {}, bindings = {};
+    const occurredAt = new Date().toISOString();
+    for (const source of ['arcade', 'interview', 'learn']) {
+      keys[source] = source.padEnd(8, '0') + '.' + opaque();
+      credentials[source] = await models.ServiceCredential.create({ service: source, keyId: source.padEnd(8, '0'), keyHash: digest(keys[source]), eventTypes: Object.keys(rules.types).filter(type => type.startsWith(source + '.')) });
+      bindings[source] = await models.ModuleGrant.create({ userId: user.id, hubId: hub.id, module: source, grantHash: digest(opaque()), stateHash: digest(opaque()), returnPath: '/' + source, membershipVersion: 1, themeVersion: 1,
+        expiresAt: new Date(Date.now() + 60000), consumedAt: new Date(Date.now() - 60000), accessJti: randomUUID(), accessExpiresAt: new Date(Date.now() + 900000), retainUntil: new Date(Date.now() + 30 * 86400000) });
+    }
+    const event = (source = 'arcade', facts = {}) => {
+      const sourceId = randomUUID();
+      return { schemaVersion: 1, eventId: source + ':' + sourceId + ':completed:v1', userId: user.id, hubId: hub.id, source,
+        type: source === 'arcade' ? 'arcade.game_completed' : source === 'interview' ? 'interview.completed' : 'learn.quiz_completed', value: 1, occurredAt,
+        metadata: { sourceId, accessJti: bindings[source].accessJti, domainVersion: 'v1', ...(source === 'arcade' ? { gameId: 'numberguess', rulesVersion: 'v1', outcome: 'success', serverDurationSeconds: 90 }
+          : source === 'interview' ? { rawScore: 100, answeredCount: 5, questionCount: 5, serverDurationSeconds: 90, rubricVersion: 'v1' }
+          : { nodeId: 'node1', mode: 'checkpoint', attemptId: sourceId, passed: true, correctCount: 4, itemCount: 5, curriculumVersion: 'v1' }), ...facts } };
+    };
+    const service = createAuraEventService({ rules });
+    await t.test('P4.2 native facts, domain writes and future scorer are atomic and replay-safe', async () => {
+      const messages = require('../../services/core/services/messageService');
+      const answers = require('../../services/core/services/answerService');
+      const claims = require('../../services/core/config/auth').verifyToken(require('../../services/core/config/auth').generateToken(user));
+      const channel = await models.Channel.create({ hubId: hub.id, slug: 'native-fixture', title: 'Native fixture', defaultSetVersion: 1 });
+      const recipient = await models.User.create({ username: 'g3-peer', email: 'peer@g3.example.test', password: opaque(), hubId: hub.id, membershipStatus: 'active', membershipVerified: true, verificationMethod: 'email', emailVerificationMethod: 'email', emailVerifiedAt: new Date(), membershipVersion: 1 });
+      const peerClaims = require('../../services/core/config/auth').verifyToken(require('../../services/core/config/auth').generateToken(recipient));
+      // Transaction seam fixture only: P6 owns real weights/caps/ledger rules.
+      const applyNativeFact = async (fact, session) => {
+        assert.ok(session.inTransaction());
+        await models.AuraBalance.updateOne({ hubId: fact.hubId, userId: fact.userId }, { $inc: { engagement: 5, total: 5 }, $set: { asOf: new Date() } }, { upsert: true, session });
+        return { eventId: fact.eventId, awardedAura: 5, weightVersion: 'fixture-native-seam' };
+      };
+      const code = { clientMessageId: randomUUID(), type: 'code', language: 'javascript', text: '  const result = 42;\n' };
+      const results = await Promise.all(Array.from({ length: 4 }, () => messages.send(peerClaims, channel.id, code, { applyNativeFact })));
+      assert.equal(new Set(results.map(row => row.message._id)).size, 1);
+      await messages.send(peerClaims, channel.id, { ...code, clientMessageId: randomUUID(), text: 'const   result = 42;' }, { applyNativeFact });
+      assert.equal(await models.NativeFact.countDocuments({ userId: recipient.id, type: 'code.shared' }), 1);
+      assert.equal((await models.AuraBalance.findOne({ userId: recipient.id })).total, 5);
+      const resource = { clientMessageId: randomUUID(), type: 'resource', text: '', title: 'Docs', url: 'https://example.test/docs#first' };
+      await messages.send(peerClaims, channel.id, resource, { applyNativeFact });
+      await messages.send(peerClaims, channel.id, { ...resource, clientMessageId: randomUUID(), url: 'https://example.test/docs#second' }, { applyNativeFact });
+      assert.equal(await models.NativeFact.countDocuments({ userId: recipient.id, type: 'resource.shared' }), 1);
+      assert.equal((await models.AuraBalance.findOne({ userId: recipient.id })).total, 10);
+      const question = (await messages.send(claims, channel.id, { clientMessageId: randomUUID(), type: 'question', text: 'Question?' })).message;
+      const answer = (await messages.send(peerClaims, channel.id, { clientMessageId: randomUUID(), type: 'answer', text: 'Answer.', questionId: question._id })).message;
+      const brokenScorer = async (fact, session) => { await applyNativeFact(fact, session); throw new Error('fixture rollback'); };
+      await assert.rejects(answers.accept(claims, question._id, { answerId: answer._id }, { applyNativeFact: brokenScorer }), /fixture rollback/);
+      assert.equal((await models.Message.findById(question._id)).acceptedAnswerId, null);
+      assert.equal(await models.NativeFact.countDocuments({ type: 'answer.accepted', userId: recipient.id }), 0);
+      assert.equal((await models.AuraBalance.findOne({ userId: recipient.id })).total, 10);
+      await Promise.all(Array.from({ length: 3 }, () => answers.accept(claims, question._id, { answerId: answer._id }, { applyNativeFact })));
+      assert.equal(await models.NativeFact.countDocuments({ type: 'answer.accepted', userId: recipient.id }), 1);
+      assert.equal((await models.AuraBalance.findOne({ userId: recipient.id })).total, 15);
+      const seq = (await models.Channel.findById(channel.id)).nextMessageSeq;
+      await assert.rejects(messages.send(peerClaims, channel.id, { ...code, clientMessageId: randomUUID(), text: 'rollback code' }, { applyNativeFact: brokenScorer }), /fixture rollback/);
+      assert.equal((await models.Channel.findById(channel.id)).nextMessageSeq, seq);
+      assert.equal(await models.Message.countDocuments({ text: 'rollback code' }), 0);
+      assert.equal((await models.AuraBalance.findOne({ userId: recipient.id })).total, 15);
+      const inactive = await messages.send(peerClaims, channel.id, { ...code, clientMessageId: randomUUID(), text: 'rules remain inactive' });
+      assert.equal((await models.NativeFact.findOne({ sourceId: inactive.message._id })).status, 'rules_inactive');
+      assert.equal((await models.AuraBalance.findOne({ userId: recipient.id })).total, 15);
+    });
+    await t.test('P5.2 study completion pending recovery commits one fact and fixture award', async () => {
+      const study = require('../../services/core/services/studyService');
+      const facts = require('../../services/core/services/studyFactService');
+      const participant = await models.User.create({ username: 'g3-study-peer', email: 'study-peer@g3.example.test', password: opaque(), hubId: hub.id, membershipStatus: 'active', membershipVerified: true, verificationMethod: 'email', emailVerificationMethod: 'email', emailVerifiedAt: new Date(), membershipVersion: 1 });
+      const room = await models.StudyRoom.create({ hubId: hub.id, channelId: new mongoose.Types.ObjectId(), hostId: user.id, clientRoomId: randomUUID(), problemId: new mongoose.Types.ObjectId(), problem: { title: 'Fixture' }, durationMinutes: 5, participantIds: [user.id, participant.id], status: 'active', startAt: new Date(Date.now() - 300000), endAt: new Date(Date.now() - 1000) });
+      const [nonempty, empty] = await models.StudySolution.create([{ hubId: hub.id, roomId: room.id, userId: participant.id, source: 'acknowledged fixture source', language: 'python', revision: 1, savedAt: new Date(Date.now() - 3000) }, { hubId: hub.id, roomId: room.id, userId: user.id, source: '   ', revision: 1, savedAt: new Date(Date.now() - 3000) }]);
+      await study.closeDue(room.id);
+      assert.equal((await models.StudySolution.findById(nonempty.id)).awardStatus, 'pending');
+      assert.equal((await models.StudySolution.findById(empty.id)).awardStatus, 'ineligible');
+      const applyNativeFact = async (fact, session) => {
+        assert.ok(session.inTransaction());
+        await models.AuraBalance.updateOne({ hubId: fact.hubId, userId: fact.userId }, { $inc: { engagement: 25, total: 25 } }, { upsert: true, session });
+        return { eventId: fact.eventId, awardedAura: 25, weightVersion: 'fixture-study-seam' };
+      };
+      await facts.reconcile({ roomId: room.id }, { applyNativeFact: async (fact, session) => { await applyNativeFact(fact, session); throw new Error('injected scorer failure'); } });
+      assert.equal((await models.StudySolution.findById(nonempty.id)).awardStatus, 'pending');
+      assert.equal(await models.NativeFact.countDocuments({ sourceId: nonempty.id }), 0);
+      assert.equal(await models.AuraBalance.countDocuments({ userId: participant.id }), 0);
+      await Promise.all(Array.from({ length: 3 }, () => facts.reconcile({ roomId: room.id }, { applyNativeFact })));
+      const fact = await models.NativeFact.findOne({ sourceId: nonempty.id });
+      assert.equal(fact.eventId, 'core:study.completed:' + nonempty.id + ':v1');
+      assert.equal(fact.occurredAt.toISOString(), room.endAt.toISOString());
+      assert.equal(fact.status, 'settled');
+      assert.equal((await models.StudySolution.findById(nonempty.id)).awardStatus, 'settled');
+      assert.equal((await models.AuraBalance.findOne({ userId: participant.id })).total, 25);
+      assert.equal(await models.NativeFact.countDocuments({ sourceId: { $in: [nonempty.id, empty.id] } }), 1);
+    });
+    await t.test('P6.1 native fixture totals 50, prospective activation, caps and shared day', async () => {
+      const scorer = require('../../services/core/services/nativeAuraService');
+      const native = require('../../services/core/services/nativeFactService');
+      const owner = await models.User.create({ username: 'native-rules-user', email: 'rules@g3.example.test', password: opaque(), hubId: hub.id, membershipStatus: 'active', membershipVerified: true, verificationMethod: 'email', emailVerificationMethod: 'email', emailVerifiedAt: new Date(), membershipVersion: 1 });
+      const fact = async (type, text = randomUUID(), at = new Date()) => native.transaction(session => native.record({ message: { _id: new mongoose.Types.ObjectId(), hubId: hub.id, authorId: owner.id, createdAt: at, text, url: 'https://example.test/' + text }, type }, session));
+      const old = await fact('code.shared'); assert.equal(old.status, 'rules_inactive');
+      await scorer.activate(); const active = await models.AuraRuleSet.findOne({ version: 'native-v1' });
+      await scorer.activate(); assert.equal((await models.AuraRuleSet.findOne({ version: 'native-v1' })).activatedAt.toISOString(), active.activatedAt.toISOString());
+      for (const type of ['study.completed', 'answer.accepted', 'code.shared', 'resource.shared']) assert.equal((await fact(type)).status, 'settled');
+      assert.equal((await models.AuraBalance.findOne({ userId: owner.id })).total, 50);
+      const saved = await models.NativeFact.findOne({ userId: owner.id, status: 'settled' });
+      const replay = await native.transaction(session => scorer.score(saved.toObject(), session));
+      assert.equal(replay.awardedAura, saved.receipt.awardedAura);
+      await assert.rejects(native.transaction(session => scorer.score({ ...saved.toObject(), sourceId: new mongoose.Types.ObjectId() }, session)), { status: 409 });
+      assert.equal((await models.AuraBalance.findOne({ userId: owner.id })).total, 50);
+      const eventCount = await models.AuraEvent.countDocuments({ userId: owner.id });
+      const originalUpdate = models.AuraBalance.updateOne;
+      models.AuraBalance.updateOne = async () => { throw new Error('native rollback fixture'); };
+      try { await assert.rejects(fact('code.shared', 'rollback-code'), /native rollback fixture/); }
+      finally { models.AuraBalance.updateOne = originalUpdate; }
+      assert.equal(await models.AuraEvent.countDocuments({ userId: owner.id }), eventCount);
+      assert.equal(await models.NativeFact.countDocuments({ userId: owner.id, status: 'settled' }), 4);
+
+      await fact('resource.shared', 'duplicate'); await fact('resource.shared', 'duplicate');
+      assert.equal((await models.AuraBalance.findOne({ userId: owner.id })).total, 55);
+      await Promise.all(Array.from({ length: 8 }, () => fact('code.shared')));
+      assert.equal((await models.AuraBalance.findOne({ userId: owner.id })).total, 75);
+      await fact('study.completed'); await fact('study.completed');
+      assert.equal((await models.AuraBalance.findOne({ userId: owner.id })).total, 100);
+      assert.equal((await fact('answer.accepted')).receipt.awardedAura, 0);
+      assert.equal((await models.AuraBalance.findOne({ userId: owner.id })).engagement, 100);
+      assert.equal(await models.DailyActivity.countDocuments({ userId: owner.id }), 1);
+      assert.equal((await fact('resource.shared', 'old-pending', new Date(+active.activatedAt - 1000))).status, 'rules_inactive');
+      assert.equal((await models.NativeFact.findById(old.id)).status, 'rules_inactive');
+      const reads = require('../../services/core/services/auraReadService');
+      await models.User.updateOne({ _id: owner.id }, { $set: { auraPoints: 999999 } });
+      assert.equal((await require('../../services/core/utils/userDto').userDto(await models.User.findById(owner.id))).auraPoints, 100);
+      const first = await reads.leaderboard({ hubId: hub.id, userId: owner.id }, { limit: '1' });
+      assert.equal(first.ownRank.auraPoints, 100);
+      const generated = [];
+      for (let i = 0; i < 55; i++) generated.push({ _id: new mongoose.Types.ObjectId(), username: 'rank-peer-' + i, email: 'rank-' + i + '@g3.example.test', hubId: hub._id, membershipStatus: 'active', membershipVerified: true, verificationMethod: 'email', emailVerificationMethod: 'email', emailVerifiedAt: new Date(), membershipVersion: 1 });
+      await models.User.collection.insertMany(generated);
+      await models.AuraBalance.insertMany(generated.map(row => ({ hubId: hub.id, userId: row._id, engagement: 200, externalBonus: 0, total: 200, asOf: new Date() })));
+      const ranked = await reads.leaderboard({ hubId: hub.id, userId: owner.id }, { limit: '50' });
+      assert.equal(ranked.items.length, 50); assert.equal(ranked.ownRank.rank, 56);
+      const next = await reads.leaderboard({ hubId: hub.id, userId: owner.id }, { limit: '50', cursor: ranked.nextCursor });
+      assert.ok(next.items.some(row => String(row._id) === owner.id && row.rank === 56));
+      await assert.rejects(reads.leaderboard({ hubId: new mongoose.Types.ObjectId().toString(), userId: owner.id }, { cursor: ranked.nextCursor }), { status: 400 });
+      const streak = require('../../services/core/services/streakService');
+      assert.equal(streak.countDays(['2026-10-02', '2026-10-01', '2026-09-30'], '2026-10-02'), 3);
+      assert.equal(streak.countDays(['2026-10-01', '2026-09-30'], '2026-10-02'), 2);
+      assert.equal(streak.countDays(['2026-09-30'], '2026-10-02'), 0);
+    });
+    server = createApp({ auraRules: rules }).listen(0);
+    await new Promise(resolve => server.once('listening', resolve));
+    const post = async (body, source = body.source, headers = {}) => {
+      const response = await fetch('http://127.0.0.1:' + server.address().port + '/api/aura/events', { method: 'POST',
+        headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + keys[source], ...headers }, body: JSON.stringify(body) });
+      return { status: response.status, body: await response.json() };
+    };
+    await t.test('concurrent identical delivery commits once; changed payload conflicts; semantic aliases cannot farm', async () => {
+      const fact = event();
+      const results = await Promise.all(Array.from({ length: 5 }, () => post(fact)));
+      assert.deepEqual(results.map(r => r.status).sort(), [200, 200, 200, 200, 201]);
+      assert.ok(results.every(r => r.body.receipt.awardedAura === 5));
+      assert.ok(results.every(r => r.body.receipt.eventId === fact.eventId));
+      assert.equal((await post({ ...fact, metadata: { ...fact.metadata, serverDurationSeconds: 91 } })).status, 409);
+      const alias = { ...fact, eventId: fact.eventId + ':retry' };
+      assert.equal((await post(alias)).body.receipt.eventId, fact.eventId);
+      assert.equal((await post({ ...alias, value: 2 })).status, 400);
+      assert.equal((await post({ ...alias, metadata: { ...alias.metadata, gameId: 'sorting' } })).status, 409);
+      assert.equal((await models.AuraBalance.findOne({ userId: user.id })).engagement, 5);
+    });
+    await t.test('source/type, Origin, retained principal, Hub and current membership are enforced', async () => {
+      assert.equal((await post(event('learn'), 'arcade')).status, 403);
+      assert.equal((await post(event(), 'arcade', { Origin: process.env.ALLOWED_ORIGINS })).status, 403);
+      for (const change of [{ hubId: new mongoose.Types.ObjectId().toString() }, { userId: new mongoose.Types.ObjectId().toString() }, { hubId: null }]) assert.ok([400, 403].includes((await post({ ...event(), ...change })).status));
+      assert.equal((await post(event('arcade', { accessJti: randomUUID() }))).status, 403);
+      await models.User.updateOne({ _id: user.id }, { $inc: { membershipVersion: 1 } });
+      assert.equal((await post(event())).status, 403);
+      await models.User.updateOne({ _id: user.id }, { $set: { membershipVersion: 1 } });
+      await models.Hub.updateOne({ _id: hub.id }, { $set: { status: 'disabled' } });
+      assert.equal((await post(event())).status, 403);
+      await models.Hub.updateOne({ _id: hub.id }, { $set: { status: 'active' } });
+      await models.ServiceCredential.updateOne({ _id: credentials.arcade.id }, { $set: { eventTypes: [] } });
+      assert.equal((await post(event())).status, 403);
+      await models.ServiceCredential.updateOne({ _id: credentials.arcade.id }, { $set: { eventTypes: ['arcade.game_completed'] } });
+    });
+    await t.test('game/day and concurrent type caps are exact; zero receipts remain terminal', async () => {
+      const capped = event();
+      const zero = await post(capped);
+      assert.equal(zero.body.receipt.awardedAura, 0);
+      assert.equal((await post(capped)).body.receipt.receivedAt, zero.body.receipt.receivedAt);
+      await post(event('arcade', { gameId: 'mathamplitude' }));
+      await post(event('arcade', { gameId: 'sorting' }));
+      const interviews = await Promise.all(Array.from({ length: 5 }, () => post(event('interview'))));
+      assert.equal(interviews.filter(r => r.body.receipt.awardedAura === 30).length, 2);
+      assert.equal(interviews.filter(r => r.body.receipt.awardedAura === 0).length, 3);
+      assert.equal((await models.AuraBalance.findOne({ userId: user.id })).engagement, 75);
+    });
+    await t.test('Learn source budget partially awards the final fact, and all sources share one day', async () => {
+      for (let i = 0; i < 8; i++) {
+        const fact = event('learn', { sourceId: 'node' + i + ':v1', nodeId: 'node' + i, curriculumVersion: 'v1', masteryMethod: 'checkpoint' });
+        fact.type = 'learn.node_mastered';
+        for (const key of ['mode', 'attemptId', 'passed', 'correctCount', 'itemCount']) delete fact.metadata[key];
+        const result = await post(fact);
+        assert.equal(result.body.receipt.awardedAura, i < 6 ? 15 : i === 6 ? 10 : 0);
+      }
+      assert.equal(await models.DailyActivity.countDocuments({ userId: user.id }), 1);
+      assert.deepEqual((await models.DailyActivity.findOne({ userId: user.id })).qualifyingSources.sort(), ['arcade', 'interview', 'learn']);
+      assert.equal((await models.AuraBalance.findOne({ userId: user.id })).engagement, 175);
+    });
+    await t.test('external replacement preserves engagement, including concurrent replacements', async () => {
+      const principal = { userId: user.id, hubId: hub.id };
+      await service.replaceExternalBonus(principal, 70);
+      let balance = await models.AuraBalance.findOne(principal);
+      assert.equal(balance.engagement, 175); assert.equal(balance.total, 245);
+      await service.replaceExternalBonus(principal, 90);
+      balance = await models.AuraBalance.findOne(principal);
+      assert.equal(balance.engagement, 175); assert.equal(balance.total, 265);
+      await Promise.all([service.replaceExternalBonus(principal, 70), service.replaceExternalBonus(principal, 90)]);
+      balance = await models.AuraBalance.findOne(principal);
+      assert.equal(balance.total, balance.engagement + balance.externalBonus);
+    });
+    await t.test('P9.1 owned Learn reset preserves Core ledger, balance and mastery uniqueness', { skip: !process.env.GUARD_LEARN_DATABASE_URL }, async () => {
+      const { Pool } = require('pg');
+      const url = new URL(process.env.GUARD_LEARN_DATABASE_URL);
+      assert.ok(['localhost','127.0.0.1'].includes(url.hostname)); assert.match(url.pathname, /^\/collegehubs_demo_learn_/);
+      const pool = new Pool({ connectionString: url.toString() });
+      const { learnerService } = await import('../../services/learn/src/services/learnerService.ts');
+      const learn = learnerService(pool), owner = { userId:user.id, hubId:hub.id };
+      const snapshot = async () => JSON.stringify({ events:await models.AuraEvent.find({userId:user.id}).sort({_id:1}).lean(), balance:await models.AuraBalance.findOne({userId:user.id}).lean(), days:await models.DailyActivity.find({userId:user.id}).sort({_id:1}).lean() });
+      try {
+        const before = await snapshot();
+        const receipt = await models.AuraEvent.findOne({userId:user.id,type:'learn.node_mastered',canonical:true,awardedAura:15}).lean(); assert.ok(receipt);
+        await learn.initialize(owner,'dsa'); await learn.reset(owner,'dsa'); await learn.initialize(owner,'dsa');
+        assert.equal(await snapshot(),before);
+        const fact = {schemaVersion:1,eventId:receipt.eventId,userId:user.id,hubId:hub.id,source:receipt.source,type:receipt.type,value:receipt.value,occurredAt:receipt.occurredAt.toISOString(),metadata:receipt.metadata};
+        const replay = await post(fact); assert.equal(replay.status,200); assert.equal(replay.body.receipt.awardedAura,15);
+        assert.equal(await snapshot(),before,'re-enrollment must not clear Core award uniqueness');
+      } finally { await pool.end(); }
+    });
+    await t.test('expired access permits late delivery within binding, while old/future/unissued facts fail', async () => {
+      await models.ModuleGrant.updateOne({ _id: bindings.arcade.id }, { $set: { accessExpiresAt: new Date(Date.now() - 1000) } });
+      const past = { ...event(), occurredAt: new Date(Date.now() - 2000).toISOString() };
+      assert.equal((await post(past)).status, 201);
+      // Use a fact after expiry, not the suite's captured start timestamp.
+      assert.equal((await post({ ...event(), occurredAt: new Date().toISOString() })).status, 403);
+      assert.equal((await post({ ...event(), occurredAt: new Date(Date.now() + 60000).toISOString() })).status, 400);
+      assert.equal((await post({ ...past, eventId: past.eventId + ':old', occurredAt: new Date(Date.now() - 31 * 86400000).toISOString() })).status, 400);
+      await models.ModuleGrant.updateOne({ _id: bindings.arcade.id }, { $set: { retainUntil: new Date(Date.now() - 1000) } });
+      assert.equal((await post(past)).status, 403);
+    });
+    await t.test('invalid facts, browser award fields, deferred types and disabled rules fail closed', async () => {
+      for (const facts of [{ rawScore: 101 }, { answeredCount: 6 }, { serverDurationSeconds: -1 }, { rawScore: '100' }, { resumeText: 'private' }]) assert.equal((await post(event('interview', facts))).status, 400);
+      assert.equal((await post({ ...event('interview'), awardedAura: 100 })).status, 400);
+      assert.equal((await post({ ...event('learn'), type: 'learn.path_completed' })).status, 400);
+      await assert.rejects(createAuraEventService().ingest(credentials.interview, event('interview')), { code: 'AURA_RULES_INACTIVE' });
+      await assert.rejects(createAuraEventService().replaceExternalBonus({ userId: user.id, hubId: hub.id }, 70), { code: 'EXTERNAL_BONUS_DISABLED' });
+    });
+    await t.test('a transaction failure rolls back receipt, day and balance together', async () => {
+      const fact = event('learn', { nodeId: 'rollback', attemptId: 'rollback', sourceId: 'rollback' });
+      const before = await models.AuraEvent.countDocuments();
+      const original = models.AuraBalance.updateOne;
+      models.AuraBalance.updateOne = async () => { throw new Error('injected storage failure'); };
+      try { assert.equal((await post(fact)).status, 503); }
+      finally { models.AuraBalance.updateOne = original; }
+      assert.equal(await models.AuraEvent.countDocuments(), before);
+      assert.equal((await post(fact)).status, 201);
+    });
+    await t.test('native and module activity share a single day; India midnight advances the day', async () => {
+      const native = require('../../services/core/services/nativeFactService');
+      await native.transaction(session => native.record({ message: { _id: new mongoose.Types.ObjectId(), hubId: hub.id, authorId: user.id, createdAt: new Date(), text: 'shared-day-proof' }, type: 'code.shared' }, session));
+      assert.equal(await models.DailyActivity.countDocuments({ userId: user.id }), 1);
+      assert.deepEqual((await models.DailyActivity.findOne({ userId: user.id })).qualifyingSources.sort(), ['arcade', 'core', 'interview', 'learn']);
+      const streak = require('../../services/core/services/streakService');
+      assert.equal(streak.dayKey(new Date('2026-10-02T18:29:59Z')), '2026-10-02');
+      assert.equal(streak.dayKey(new Date('2026-10-02T18:30:00Z')), '2026-10-03');
+    });
+    await t.test('P9.2 durable Learn outbox recovers transport failure and a lost Core receipt exactly once', {skip:!process.env.GUARD_LEARN_DATABASE_URL}, async()=>{
+      const {Pool}=require('pg'), url=new URL(process.env.GUARD_LEARN_DATABASE_URL);
+      assert.ok(['localhost','127.0.0.1'].includes(url.hostname));assert.match(url.pathname,/^\/collegehubs_demo_learn_/);
+      const pool=new Pool({connectionString:url.toString()});
+      const {learnerService}=await import('../../services/learn/src/services/learnerService.ts'),{attemptService}=await import('../../services/learn/src/services/attemptService.ts'),{coreEvents}=await import('../../services/learn/src/services/coreEvents.ts');
+      const learner=await models.User.create({username:'learn-'+randomUUID(),email:randomUUID()+'@g3.example.test',password:opaque(),hubId:hub.id,membershipStatus:'active',membershipVerified:true,verificationMethod:'email',emailVerificationMethod:'email',emailVerifiedAt:new Date(),membershipVersion:1});
+      const binding=await models.ModuleGrant.create({userId:learner.id,hubId:hub.id,module:'learn',grantHash:digest(opaque()),stateHash:digest(opaque()),returnPath:'/learn',membershipVersion:1,themeVersion:1,expiresAt:new Date(Date.now()+60000),consumedAt:new Date(),accessJti:randomUUID(),accessExpiresAt:new Date(Date.now()+900000),retainUntil:new Date(Date.now()+30*86400000)});
+      const owner={hubId:hub.id,userId:learner.id},learning=learnerService(pool),quiz=attemptService(pool),config={origin:'http://localhost:5173',secure:false,core:'http://127.0.0.1:'+server.address().port,serviceKey:keys.learn};
+      try{
+        await learning.initialize(owner,'dsa');const node=(await learning.graph(owner)).nodes.find(n=>n.status==='unlocked');
+        let attempt=await quiz.create(owner,node.id,'checkpoint',randomUUID());
+        const snapshot=(await pool.query('SELECT questions FROM quiz_attempt WHERE hub_id=$1 AND user_id=$2 AND id=$3',[owner.hubId,owner.userId,attempt.id])).rows[0].questions;
+        while(attempt.question){const q=snapshot.find(q=>q.id===attempt.question.id);attempt=await quiz.answer(owner,attempt.id,q.id,q.correct,randomUUID());}
+        const result=await quiz.finalize(owner,attempt.id,{jti:binding.accessJti,exp:Math.floor(+binding.accessExpiresAt/1000)});assert.equal(result.rewards.length,2);
+        const ids=result.rewards.map(r=>r.eventId),due=()=>pool.query("UPDATE learn_event SET next_attempt_at=to_timestamp(0) WHERE hub_id=$1 AND user_id=$2 AND status='pending'",[owner.hubId,owner.userId]);
+        await coreEvents(pool,config,async()=>{throw Error('Core offline');}).deliver(ids[0]);
+        assert.equal((await quiz.get(owner,attempt.id)).rewards[0].status,'pending');assert.equal(await models.AuraEvent.countDocuments({userId:learner.id}),0);
+        await due();let accepted;
+        await coreEvents(pool,config,async(...args)=>{const response=await fetch(...args);accepted=await response.json();assert.ok([200,201].includes(response.status));throw Error('Reply lost after commit');}).deliver(ids[0]);
+        assert.ok(accepted.receipt);assert.equal(await models.AuraEvent.countDocuments({userId:learner.id}),1);assert.equal((await quiz.get(owner,attempt.id)).rewards[0].status,'pending');
+        await due();const restarted=coreEvents(pool,config);await Promise.all([restarted.reconcile(owner,attempt.id),restarted.reconcile(owner,attempt.id)]);
+        const final=await quiz.get(owner,attempt.id);assert.ok(final.rewards.every(r=>r.status==='settled'));assert.equal(final.rewards.reduce((n,r)=>n+r.receipt.awardedAura,0),20);
+        assert.equal(await models.AuraEvent.countDocuments({userId:learner.id}),2);assert.equal((await models.AuraBalance.findOne({userId:learner.id})).total,20);
+        await restarted.reconcile(owner,attempt.id);assert.deepEqual((await quiz.get(owner,attempt.id)).result,result.result);
+        await assert.rejects(pool.query("UPDATE learn_event SET status='pending' WHERE event_id=$1",[ids[0]]),/Immutable/);
+      }finally{await pool.end();}
+    });
+    await t.test('TP7.1 prospective rules retain historical policy and accept only the frozen Spot-the-Bug version', async () => {
+      const activate = require('../../services/core/services/nativeAuraService').activate;
+      const oldRules = require('../../services/core/config/auraRules.arcade.v2.json');
+      const newRules = require('../../services/core/config/auraRules.arcade.v3.json');
+      const old = await activate(oldRules);
+      // Explicit times in this disposable database make the boundary deterministic.
+      const boundary = new Date();
+      await models.AuraRuleSet.collection.updateOne({ _id: old._id }, { $set: { activatedAt: new Date(+boundary - 1000) } });
+      const current = await activate(newRules);
+      await models.AuraRuleSet.collection.updateOne({ _id: current._id }, { $set: { activatedAt: boundary } });
+      const real = createAuraEventService();
+      const player = await models.User.create({ username: 'spot-'+randomUUID(), email: randomUUID()+'@g3.example.test', password: opaque(), hubId: hub.id, membershipStatus: 'active', membershipVerified: true, verificationMethod: 'email', emailVerificationMethod: 'email', emailVerifiedAt: new Date(), membershipVersion: 1 });
+      const grant = await models.ModuleGrant.create({ userId: player.id, hubId: hub.id, module: 'arcade', grantHash: digest(opaque()), stateHash: digest(opaque()), returnPath: '/arcade', membershipVersion: 1, themeVersion: 1, expiresAt: new Date(Date.now()+60000), consumedAt: new Date(+boundary-2000), accessJti: randomUUID(), accessExpiresAt: new Date(Date.now()+900000), retainUntil: new Date(Date.now()+86400000) });
+      const spotEvent = metadata => { const e = event('arcade', { ...metadata, accessJti: grant.accessJti }); return { ...e, userId: player.id }; };
+      const historic = { ...spotEvent({ rulesVersion: 'numberguess-v1' }), occurredAt: new Date(+boundary - 500).toISOString() };
+      assert.equal((await real.ingest(credentials.arcade, historic)).body.receipt.weightVersion, oldRules.version);
+      const spot = { ...spotEvent({ gameId: 'spotbug', rulesVersion: 'spotbug-v1' }), occurredAt: boundary.toISOString() };
+      const result = await real.ingest(credentials.arcade, spot);
+      assert.equal(result.body.receipt.weightVersion, newRules.version);
+      assert.equal(result.body.receipt.awardedAura, 5);
+      assert.deepEqual((await real.ingest(credentials.arcade, spot)).body.receipt, result.body.receipt);
+      await assert.rejects(real.ingest(credentials.arcade, { ...spot, occurredAt: new Date(+boundary - 500).toISOString() }), { code: 'AURA_RULES_INACTIVE' });
+      await assert.rejects(real.ingest(credentials.arcade, { ...spot, metadata: { ...spot.metadata, rulesVersion: 'spotbug-v2' } }), { code: 'AURA_RULES_INACTIVE' });
+      const dailyRules = require('../../services/core/config/auraRules.arcade.v4.json');
+      const dailyActive = await activate(dailyRules);
+      const dailyInfo = require('../../packages/contracts/arcade-daily.cjs').definition(dailyActive.activatedAt);
+      const sourceId = randomUUID();
+      const daily = { ...spot, eventId:'arcade:'+sourceId+':completed:v1', type:'arcade.daily_completed', occurredAt:dailyActive.activatedAt.toISOString(), metadata:{ sourceId, accessJti:grant.accessJti,domainVersion:'v1', challengeId:dailyInfo.challengeId,challengeDay:dailyInfo.challengeDay,rulesVersion:'daily-v1',outcome:'success',serverDurationSeconds:30 } };
+      const credential = {...credentials.arcade.toObject(),eventTypes:['arcade.game_completed','arcade.daily_completed']};
+      const results = await Promise.all([real.ingest(credential,daily),real.ingest(credential,daily)]);
+      assert.equal(results[0].body.receipt.awardedAura,15);assert.deepEqual(results[0].body.receipt,results[1].body.receipt);
+      const alias = {...daily,eventId:'arcade:'+randomUUID()+':completed:v1'};
+      assert.equal((await real.ingest(credential,alias)).body.status,'duplicate');
+      assert.equal(await models.DailyActivity.countDocuments({userId:player.id}),1);
+      assert.equal((await models.AuraBalance.findOne({userId:player.id})).total,25);
+      await assert.rejects(real.ingest(credential,{...daily,metadata:{...daily.metadata,challengeId:'forged'}}),{code:'AURA_RULES_INACTIVE'});
+      const ordinary = {...spotEvent({gameId:'sorting',rulesVersion:'sorting-v1'}),occurredAt:dailyActive.activatedAt.toISOString()};
+      assert.equal((await real.ingest(credential,ordinary)).body.receipt.awardedAura,5);
+      const capped = {...spotEvent({gameId:'mathamplitude',rulesVersion:'mathamplitude-v1'}),occurredAt:dailyActive.activatedAt.toISOString()};
+      assert.equal((await real.ingest(credential,capped)).body.receipt.awardedAura,0);
+      assert.equal((await models.AuraBalance.findOne({userId:player.id})).total,30);
+      for (let daysBack=1;daysBack<=6;daysBack++) {
+        const at = new Date(+dailyActive.activatedAt-daysBack*86400000);
+        await models.DailyActivity.create({userId:player.id,hubId:hub.id,dayKey:require('../../packages/contracts/day-policy.cjs').dayKey(at),timezonePolicyVersion:1,firstOccurredAt:at,qualifyingSources:['arcade']});
+      }
+      await require('../../services/core/services/achievementService').project(mongoose.connection.db,{userId:player._id,hubId:hub._id});
+      assert.ok(await mongoose.connection.db.collection('achievementawards').findOne({userId:player._id,badgeId:'consistent-learner'}));
+
+
+    });
+    await t.test('TP8.1 canonical curriculum receipts are prospective and duplicate mastery cannot farm',async()=>{
+      const activate=require('../../services/core/services/nativeAuraService').activate;
+      const active=await activate(require('../../services/core/config/auraRules.learn.v2.json'));
+      const learner=await models.User.create({username:'foundations-'+randomUUID(),email:randomUUID()+'@g3.example.test',password:opaque(),hubId:hub.id,membershipStatus:'active',membershipVerified:true,verificationMethod:'email',emailVerificationMethod:'email',emailVerifiedAt:new Date(),membershipVersion:1});
+      const grant=await models.ModuleGrant.create({userId:learner.id,hubId:hub.id,module:'learn',grantHash:digest(opaque()),stateHash:digest(opaque()),returnPath:'/learn',membershipVersion:1,themeVersion:1,expiresAt:new Date(Date.now()+60000),consumedAt:new Date(+active.activatedAt-1000),accessJti:randomUUID(),accessExpiresAt:new Date(Date.now()+900000),retainUntil:new Date(Date.now()+86400000)});
+      const nodeId=require('../../packages/contracts/learn-curricula.json').equivalence.find(n=>n.domain==='ml').canonicalId;
+      const fact={schemaVersion:1,eventId:'learn:'+randomUUID()+':mastered:v1',userId:learner.id,hubId:hub.id,source:'learn',type:'learn.node_mastered',value:1,occurredAt:active.activatedAt.toISOString(),metadata:{sourceId:nodeId+':foundations-v1',accessJti:grant.accessJti,domainVersion:'v1',nodeId,curriculumVersion:'foundations-v1',masteryMethod:'checkpoint'}};
+      const service=createAuraEventService();
+      await assert.rejects(service.ingest(credentials.learn,{...fact,occurredAt:new Date(+active.activatedAt-1).toISOString()}),{code:'AURA_RULES_INACTIVE'});
+      assert.equal((await service.ingest(credentials.learn,fact)).body.receipt.awardedAura,15);
+      const alias={...fact,eventId:'learn:'+randomUUID()+':mastered:v1'};
+      assert.equal((await service.ingest(credentials.learn,alias)).body.status,'duplicate');
+      const foreign=randomUUID();await assert.rejects(service.ingest(credentials.learn,{...fact,metadata:{...fact.metadata,nodeId:foreign,sourceId:foreign+':foundations-v1'}}),{code:'AURA_RULES_INACTIVE'});
+      assert.equal((await models.AuraBalance.findOne({userId:learner.id})).total,15);
+      const pathRules=await activate(require('../../services/core/config/auraRules.learn.paths.v1.json'));
+      const path={...fact,eventId:'learn:'+randomUUID()+':path:v1',type:'learn.path_completed',occurredAt:pathRules.activatedAt.toISOString(),metadata:{sourceId:'foundations:ml:foundations-v1',pathId:'foundations:ml',curriculumVersion:'foundations-v1',domainVersion:'v1',accessJti:grant.accessJti,requiredNodeCount:3,completedNodeCount:3}};
+      const scoped={service:'learn',eventTypes:['learn.path_completed']};
+      await assert.rejects(service.ingest(scoped,{...path,occurredAt:new Date(+pathRules.activatedAt-1).toISOString()}),{code:'AURA_RULES_INACTIVE'});
+      await assert.rejects(service.ingest({service:'learn',eventTypes:[]},path),{code:'EVENT_SCOPE_FORBIDDEN'});
+      const receipt=(await service.ingest(scoped,path)).body.receipt;assert.equal(receipt.awardedAura,30);
+      assert.deepEqual((await service.ingest(scoped,path)).body.receipt,receipt);
+      assert.deepEqual((await service.ingest(scoped,{...path,eventId:randomUUID()})).body.receipt,receipt);
+      for(const domain of ['dsa','web','backend'])await service.ingest(scoped,{...path,eventId:randomUUID(),metadata:{...path.metadata,pathId:'foundations:'+domain,sourceId:'foundations:'+domain+':foundations-v1'}});
+      assert.equal((await models.AuraBalance.findOne({userId:learner.id})).total,100);
+      await assert.rejects(service.ingest(scoped,{...path,eventId:randomUUID(),metadata:{...path.metadata,requiredNodeCount:4,completedNodeCount:4}}),{code:'INVALID_EVENT'});
+    });
+    await t.test('malformed JSON and oversized bodies use bounded contract errors; throttling supplies Retry-After', async () => {
+      const url = 'http://127.0.0.1:' + server.address().port + '/api/aura/events';
+      for (const [body, status] of [['{broken', 400], [JSON.stringify({ text: 'x'.repeat(66000) }), 413]]) {
+        const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+        assert.equal(response.status, status); assert.equal((await response.json()).error.retryable, false);
+      }
+      let limited;
+      for (let i = 0; i <= 120; i++) {
+        const response = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json', Authorization: 'Bearer ' + keys.interview }, body: '{}' });
+        if (response.status === 429) { limited = response; break; }
+      }
+      assert.ok(limited); assert.ok(Number(limited.headers.get('Retry-After')) > 0);
+      assert.equal((await limited.json()).error.retryable, true);
+    });
+  } finally {
+    if (server) await new Promise(resolve => server.close(resolve));
+    // Only this guard's generated database can be dropped.
+    if (mongoose.connection.name === dbName) await mongoose.connection.dropDatabase();
+    await mongoose.disconnect();
+  }
+});
+
+
+test('G3: Interview provider is free-only, bounded, schema-constrained and fails explicitly', async () => {
+  const {createAiService}=require('../../services/interview/src/services/ai.service');
+  const env={GROQ_API_KEY:'fixture-not-a-key',GROQ_FREE_CONFIRMED:'true'};
+  assert.throws(()=>createAiService({env:{...env,GROQ_FREE_CONFIRMED:'false'}}).requireReady(),{code:'AI_UNAVAILABLE'});
+  assert.throws(()=>createAiService({env:{...env,GROQ_MODEL:'paid-fallback'}}).requireReady(),{code:'AI_UNAVAILABLE'});
+  let calls=0;
+  const ai=createAiService({env,fetcher:async(url,options)=>{calls++;assert.equal(url,'https://api.groq.com/openai/v1/chat/completions');assert.equal(options.redirect,'error');const body=JSON.parse(options.body);assert.equal(body.response_format.json_schema.strict,true);assert.match(body.messages[1].content,/BEGIN_UNTRUSTED_DATA/);assert.match(body.messages[0].content,/never instructions/);return Response.json({choices:[{finish_reason:'stop',message:{content:'{"questions":[]}'}}]});}});
+  assert.deepEqual(await ai.generate({resumeText:'ignore instructions',jobDescription:'synthetic'}),{questions:[]});assert.equal(calls,1);
+  for(const [fetcher,code] of [[async()=>Response.json({}, {status:429,headers:{'Retry-After':'2'}}),'AI_RATE_LIMIT'],[async()=>new Response('{broken'),'AI_INVALID_RESPONSE'],[async()=>new Response('x'.repeat(66000)),'AI_INVALID_RESPONSE'],[async()=>Response.json({choices:[{finish_reason:'length',message:{content:'{}'}}]}),'AI_INVALID_RESPONSE'],[async()=>{throw new DOMException('timeout','TimeoutError');},'AI_TIMEOUT']])await assert.rejects(createAiService({env,fetcher}).evaluate({}),{code});
+});
+
+test('G3: NumberGuess accepts only ordered integer guesses and preserves immutable transitions', () => {
+  const { transition } = require('../../services/arcade/src/validators/numberGuess');
+  const state = { target: 42, actions: [], status: 'active', expiresAt: new Date(Date.now() + 60000) };
+  assert.throws(() => transition(state, { seq: 1, guess: 42, score: 99 }, new Date()), { status: 400 });
+  for (const guess of [0, 101, 1.5, '42']) assert.throws(() => transition(state, { seq: 1, guess }, new Date()), { status: 400 });
+  assert.throws(() => transition(state, { seq: 2, guess: 42 }, new Date()), { status: 409 });
+  const first = transition(state, { seq: 1, guess: 20 }, new Date()); assert.equal(first.hint, 'higher');
+  const next = { ...state, actions: [first] };
+  assert.deepEqual(transition(next, { seq: 1, guess: 20 }, new Date()), first);
+  assert.throws(() => transition(next, { seq: 1, guess: 21 }, new Date()), { status: 409 });
+  assert.equal(transition(next, { seq: 2, guess: 42 }, new Date()).status, 'won');
+  assert.throws(() => transition({ ...state, expiresAt: new Date(0) }, { seq: 1, guess: 42 }, new Date()), { status: 409 });
+  const used = { ...state, actions: Array.from({length:9}, (_,i) => ({seq:i+1,guess:1,status:'active',hint:'higher'})) };
+  assert.equal(transition(used, { seq:10, guess:1 }, new Date()).status, 'lost');
+});
+
+test('G3: MathAmplitude binds answers and replays, enforces server time and qualification', () => {
+  const { transition, finish } = require('../../services/arcade/src/validators/math');
+  const start = new Date('2026-10-06T12:00:00Z');
+  const game = {status:'active',createdAt:start,expiresAt:new Date(+start+60000),actions:[],challenge:{questions:[{id:'a',num1:6,num2:7,operation:'*',answer:42},{id:'b',num1:12,num2:3,operation:'/',answer:4}]},mathState:{questionIndex:0,correctCount:0}};
+  const at = new Date(+start+1000);
+  for (const input of [{seq:1,questionId:'a',answer:'42'},{seq:1,questionId:'a',answer:42.1},{seq:1,questionId:'a',answer:42,score:99}]) assert.throws(()=>transition(game,input,at),{status:400});
+  assert.throws(()=>transition(game,{seq:1,questionId:'b',answer:4},at),{status:409});
+  assert.throws(()=>transition(game,{seq:2,questionId:'a',answer:42},at),{status:409});
+  const wrong=transition(game,{seq:1,questionId:'a',answer:41},at);assert.equal(wrong.step.correct,false);assert.deepEqual(wrong.mathState,{questionIndex:0,correctCount:0});
+  const next={...game,actions:[wrong.step],mathState:wrong.mathState};
+  assert.deepEqual(transition(next,{seq:1,questionId:'a',answer:41},new Date(+start+70000)).step,wrong.step);
+  assert.throws(()=>transition(next,{seq:1,questionId:'a',answer:42},at),{status:409});
+  const right=transition(next,{seq:2,questionId:'a',answer:42},at);assert.deepEqual(right.mathState,{questionIndex:1,correctCount:1});
+  assert.throws(()=>transition(next,{seq:2,questionId:'a',answer:42},game.expiresAt),{status:409});
+  assert.throws(()=>finish({...game,mathState:{correctCount:5}},new Date(+start+29999)),{status:409});
+  assert.equal(finish({...game,mathState:{correctCount:5}},new Date(+start+30000)),'won');
+  assert.equal(finish({...game,mathState:{correctCount:4}},new Date(+start+60000)),'lost');
+});
+
+test('G3: Sorting requires a complete bounded comparison/swap trace and complexity', () => {
+  const { transition }=require('../../services/arcade/src/validators/sorting');
+  let game={status:'active',expiresAt:new Date(Date.now()+60000),actions:[],challenge:{initialArray:[3,1,2]},sortingState:{array:[3,1,2],pass:0,index:0,needsSwap:false,comparisons:0,swaps:0,traceComplete:false}};
+  const at=new Date(),action=input=>{const reply=transition(game,{seq:game.actions.length+1,...input},at);game={...game,actions:[...game.actions,reply.step],sortingState:reply.sortingState||game.sortingState,status:reply.step.status};return reply.step;};
+  assert.throws(()=>transition(game,{seq:1,type:'swap',left:0,right:1},at),{status:409});
+  assert.throws(()=>transition(game,{seq:1,type:'compare',left:1,right:2},at),{status:409});
+  assert.throws(()=>transition(game,{seq:1,type:'complexity',choice:'quadratic'},at),{status:409});
+  assert.throws(()=>transition(game,{seq:1,type:'compare',left:0,right:1,array:[1,2,3]},at),{status:400});
+  const first=action({type:'compare',left:0,right:1});assert.equal(game.sortingState.needsSwap,true);
+  assert.deepEqual(transition(game,{seq:1,type:'compare',left:0,right:1},at).step,first);
+  assert.throws(()=>transition(game,{seq:1,type:'compare',left:1,right:2},at),{status:409});
+  while(!game.sortingState.traceComplete){const s=game.sortingState;action({type:s.needsSwap?'swap':'compare',left:s.index,right:s.index+1});}
+  assert.deepEqual(game.sortingState.array,[1,2,3]);assert.equal(game.sortingState.comparisons,3);assert.equal(game.sortingState.swaps,2);
+  assert.throws(()=>transition(game,{seq:game.actions.length+1,type:'complexity',choice:'linear'},at),{status:400});
+  const win=action({type:'complexity',choice:'quadratic'});assert.equal(win.status,'won');assert.ok(game.actions.length<=7);
+  assert.deepEqual(transition(game,{seq:win.seq,type:'complexity',choice:'quadratic'},at).step,win);
+});
+
+test('G3: P9.2 grades frozen answers on the server at exact thresholds', async () => {
+  const {validateCurriculum,curriculum,bank}=await import('../../services/learn/src/services/plannerAgent.ts');
+  assert.deepEqual(validateCurriculum(),{nodes:15,questions:225,version:'foundations-v1'});
+  const cycle=structuredClone(curriculum);cycle.nodes[0].prerequisites=[cycle.nodes[1].slug];assert.throws(()=>validateCurriculum(cycle,bank),/cycle/);
+  const missing=structuredClone(curriculum);missing.nodes[1].prerequisites=['missing'];assert.throws(()=>validateCurriculum(missing,bank));
+  const draft=structuredClone(bank);draft.review.status='draft';assert.throws(()=>validateCurriculum(curriculum,draft));
+  const bad=structuredClone(bank);bad.nodes[0].items[0].correct='z';assert.throws(()=>validateCurriculum(curriculum,bad),/Invalid question/);
+  const { gradeAttempt } = await import('../../services/learn/src/services/assessmentService.ts');
+  const questions = Array.from({length:10},(_,i)=>({id:'q'+i,correct:'a',explanation:'Reason',options:[{id:'a',text:'yes'},{id:'b',text:'no'}]}));
+  const answers = count => Object.fromEntries(questions.map((q,i)=>[q.id,{optionId:i<count?'a':'b'}]));
+  assert.equal(gradeAttempt('checkpoint',questions.slice(0,5),answers(3)).passed,true);
+  assert.equal(gradeAttempt('checkpoint',questions.slice(0,5),answers(2)).passed,false);
+  assert.equal(gradeAttempt('test-out',questions,answers(8)).passed,true);
+  assert.equal(gradeAttempt('test-out',questions,answers(7)).passed,false);
+  assert.equal(gradeAttempt('test-out',questions,answers(10)).theta,3);
+  assert.equal(gradeAttempt('test-out',questions,answers(0)).theta,-3);
+  assert.throws(()=>gradeAttempt('checkpoint',questions,answers(10)));
+  assert.throws(()=>gradeAttempt('checkpoint',questions.slice(0,5),{}));
+});

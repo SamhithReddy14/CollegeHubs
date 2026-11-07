@@ -1,0 +1,197 @@
+# Repo-root context includes the lock and shared contracts.
+previews:
+  generation: "off"
+services:
+  - type: web
+    name: collegehubs-core
+    runtime: node
+    plan: free
+    buildCommand: node deploy/build.mjs core
+    startCommand: npm start --workspace @collegehubs/core
+    healthCheckPath: /health/ready
+    buildFilter:
+      paths:
+        - services/core/**
+        - packages/contracts/**
+        - scripts/check-core.cjs
+        - deploy/build.mjs
+        - package.json
+        - package-lock.json
+        - render.yaml
+    envVars:
+      - key: NODE_VERSION
+        value: 24.12.0
+      - key: NODE_ENV
+        value: production
+      - key: MONGO_URI
+        sync: false
+      - key: JWT_SECRET
+        generateValue: true
+      - key: ALLOWED_ORIGINS
+        sync: false
+      - key: APP_ORIGIN
+        sync: false
+      - key: ENABLE_MODULES
+        value: learn,arcade,interview
+      - key: CORE_MODULE_PRIVATE_KEY
+        sync: false
+      - key: CORE_MODULE_KEY_ID
+        sync: false
+      - key: CORE_MODULE_PUBLIC_KEYS
+        sync: false
+      # Preserve existing settings; activate only after migration/account review.
+      - key: CORE_SESSION_ENABLED
+        sync: false
+      - key: VERIFICATION_MAIL_MODE
+        sync: false
+      - key: BREVO_API_KEY
+        sync: false
+      - key: VERIFICATION_MAIL_FROM
+        sync: false
+      - key: LEARN_API_ORIGIN
+        sync: false
+      - key: ARCADE_API_ORIGIN
+        sync: false
+      - key: INTERVIEW_API_ORIGIN
+        sync: false
+      - key: LEARN_READ_KEY
+        sync: false
+      - key: ARCADE_READ_KEY
+        sync: false
+      - key: INTERVIEW_READ_KEY
+        sync: false
+  - type: web
+    name: collegehubs-learn
+    runtime: node
+    plan: free
+    buildCommand: node deploy/build.mjs learn
+    startCommand: npm start --workspace @collegehubs/learn
+    healthCheckPath: /health/ready
+    buildFilter:
+      paths:
+        - services/learn/**
+        - packages/contracts/**
+        - deploy/build.mjs
+        - package.json
+        - package-lock.json
+        - render.yaml
+    envVars:
+      - key: NODE_VERSION
+        value: 24.12.0
+      - key: NODE_ENV
+        value: production
+      - key: DATABASE_URL
+        sync: false
+      - key: APP_ORIGIN
+        sync: false
+      - key: CORE_API_BASE_URL
+        sync: false
+      - key: CORE_TOKEN_ISSUER
+        value: collegehubs-core
+      - key: CORE_TOKEN_AUDIENCE
+        value: collegehubs-learn
+      - key: CORE_PUBLIC_KEY
+        sync: false
+      - key: CORE_KEY_ID
+        sync: false
+      - key: CORE_SERVICE_KEY
+        sync: false
+      - key: LEARN_RECONCILE_KEY
+        sync: false
+      - key: MODULE_READ_KEY
+        sync: false
+      - key: LEARN_RESOURCE_LOOKUP_ENABLED
+        value: "false"
+  - type: web
+    name: collegehubs-arcade
+    runtime: node
+    plan: free
+    buildCommand: node deploy/build.mjs arcade
+    startCommand: npm start --workspace @collegehubs/arcade
+    healthCheckPath: /health/ready
+    buildFilter:
+      paths:
+        - services/arcade/**
+        - packages/contracts/**
+        - scripts/check-arcade.cjs
+        - deploy/build.mjs
+        - package.json
+        - package-lock.json
+        - render.yaml
+    envVars:
+      - key: NODE_VERSION
+        value: 24.12.0
+      - key: NODE_ENV
+        value: production
+      - key: ARCADE_MONGO_URI
+        sync: false
+      - key: APP_ORIGIN
+        sync: false
+      - key: CORE_API_BASE_URL
+        sync: false
+      - key: CORE_TOKEN_ISSUER
+        value: collegehubs-core
+      - key: CORE_TOKEN_AUDIENCE
+        value: collegehubs-arcade
+      - key: CORE_PUBLIC_KEY
+        sync: false
+      - key: CORE_KEY_ID
+        sync: false
+      - key: CORE_SERVICE_KEY
+        sync: false
+      - key: ARCADE_RECONCILE_KEY
+        sync: false
+      - key: MODULE_READ_KEY
+        sync: false
+  - type: web
+    name: collegehubs-interview
+    runtime: node
+    plan: free
+    buildCommand: node deploy/build.mjs interview
+    startCommand: npm start --workspace @collegehubs/interview
+    healthCheckPath: /health/ready
+    buildFilter:
+      paths:
+        - services/interview/**
+        - packages/contracts/**
+        - scripts/check-interview.cjs
+        - deploy/build.mjs
+        - package.json
+        - package-lock.json
+        - render.yaml
+    envVars:
+      - key: NODE_VERSION
+        value: 24.12.0
+      - key: NODE_ENV
+        value: production
+      - key: INTERVIEW_MONGO_URI
+        sync: false
+      - key: APP_ORIGIN
+        sync: false
+      - key: CORE_API_BASE_URL
+        sync: false
+      - key: CORE_TOKEN_ISSUER
+        value: collegehubs-core
+      - key: CORE_TOKEN_AUDIENCE
+        value: collegehubs-interview
+      - key: CORE_PUBLIC_KEY
+        sync: false
+      - key: CORE_KEY_ID
+        sync: false
+      - key: CORE_SERVICE_KEY
+        sync: false
+
+      - key: GROQ_API_KEY
+        sync: false
+      - key: GROQ_MODEL
+        value: openai/gpt-oss-20b
+      - key: GROQ_FREE_CONFIRMED
+        sync: false
+      - key: INTERVIEW_AI_ENABLED
+        sync: false
+      - key: INTERVIEW_AI_PROVIDER
+        sync: false
+      - key: MODULE_READ_KEY
+        sync: false
+      - key: INTERVIEW_RECONCILE_KEY
+        sync: false

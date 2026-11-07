@@ -1,0 +1,42 @@
+import {contextualTutor} from '../services/contextualTutor.ts';
+import { createHash, timingSafeEqual } from 'node:crypto';
+import type { Request, Response } from 'express';
+import type { SessionStore } from '../auth/sessionService.ts';
+import { cookie } from '../auth/sessionRoutes.ts';
+import type { Database, Owner } from '../db/index.ts';
+import { learnerService, fail, domainValue, ratingValue, preferencesValue, nodeId } from '../services/learnerService.ts';
+
+export function body(req: Request, keys: string[]) {
+  if (!req.is('application/json') || !req.body || typeof req.body !== 'object' || Array.isArray(req.body) || Object.keys(req.body).length !== keys.length || keys.some(k => !Object.hasOwn(req.body, k))) throw fail(400, 'INVALID_BODY', 'Send only the documented JSON fields.');
+  return req.body;
+}
+export function learningHandler(store: SessionStore) {
+  return (work: (o: Owner, req: Request, principal: any) => unknown) => async (req: Request, res: Response) => {
+    const session = await store.get(cookie(req, 'session'));
+    if (!['GET', 'HEAD'].includes(req.method)) {
+      const csrf = req.get('X-CSRF-Token');
+      if (!csrf || !/^[a-f0-9]{64}$/.test(csrf) || !/^[a-f0-9]{64}$/.test(session.csrf_hash || '') ||
+        !timingSafeEqual(createHash('sha256').update(csrf).digest(), Buffer.from(session.csrf_hash, 'hex'))) throw fail(403, 'CSRF_INVALID', 'Reconnect Learn before saving changes.');
+    }
+    res.json(await work({ userId: session.user_id, hubId: session.hub_id }, req, session.principal));
+  };
+}
+export function learningController(pool: Database, store: SessionStore) {
+  const service = learnerService(pool), handler = learningHandler(store);
+  return {
+    domains: handler(o => service.domains(o)), graph: handler(o => service.graph(o)),
+    stats: handler(o => service.stats(o)), milestones: handler(o => service.milestones(o)),
+    profile: handler(o => service.profile(o)),
+    preferences: handler((o, req) => service.preferences(o, preferencesValue(body(req, ['goal', 'dailyMinutes'])))),
+    onboardingProfile: handler((o, req) => service.onboardingProfile(o,domainValue(body(req, ['domain']).domain))),
+    onboard: handler((o, req) => { const b = body(req, ['domain', 'selfRating', 'goal', 'dailyMinutes']); return service.onboard(o, domainValue(b.domain), ratingValue(b.selfRating), preferencesValue(b)); }),
+    intake: handler((o, req) => { const b = body(req, ['domain', 'selfRating']); return service.intake(o, domainValue(b.domain), ratingValue(b.selfRating)); }),
+    initialize: handler((o, req) => service.initialize(o, domainValue(body(req, ['domain']).domain))),
+    upgrade: handler((o,req)=>{const b=body(req,['domain','fromVersion','toVersion']);if(typeof b.fromVersion!=='string'||typeof b.toVersion!=='string')throw fail(400,'INVALID_UPGRADE','Choose a published version.');return service.upgrade(o,domainValue(b.domain),b.fromVersion,b.toVersion);}),
+    node: handler((o, req) => service.node(o, nodeId(req.params.id))),
+    reviewRemediation:handler((o,req)=>service.reviewRemediation(o,nodeId(body(req,['id']).id))),
+    recommend: handler((o, req) => service.recommend(o, nodeId(body(req, ['nodeId']).nodeId))),
+    tutor: handler((o, req) => { const b = body(req, ['nodeId', 'contentId']); return contextualTutor(pool)(o, nodeId(b.nodeId), nodeId(b.contentId)); }),
+    reset: handler((o, req) => service.reset(o, domainValue(body(req, ['domain']).domain)))
+  };
+}
